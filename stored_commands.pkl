@@ -1,0 +1,3 @@
+slap!function!lambda x: '/me slaps %s with a slippery trout' % (x)
+punch!function!lambda x: '/me gives %s a black eye' % (x)
+lmgtfy!function!lambda x: 'http://lmgtfy.com/q=' + '+'.join(x.split(' '))
