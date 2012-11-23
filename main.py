@@ -1,10 +1,31 @@
 from twisted.words.protocols import irc
 from twisted.internet import protocol, reactor
-import re
+from twisted.python import log
 import os
+import time
 import sys
+import re
 from collections import defaultdict
 SEPERATOR = '============================================'
+REGULARS = ['speilberg0', 'marcogmontiero', 'dshoreman', 'pfote', 'code', 'Zogot']
+commands = defaultdict(list)
+
+
+class MessageLogger:
+    """
+    An independant logger class
+    """
+    def __init__(self, file):
+        self.file = file
+
+    def log(self, message):
+        """Write message to file."""
+        timestamp = time.strftime("[%H:%M:%S]", time.localtime(time.time()))
+        self.file.write('%s %s\n' % (timestamp, message))
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
 
 
 class MomBot(irc.IRCClient):
@@ -12,120 +33,171 @@ class MomBot(irc.IRCClient):
         return self.factory.nickname
     nickname = property(_get_nickname)
 
+    def connectionMade(self):
+        irc.IRCClient.connectionMade(self)
+        self.logger = MessageLogger(open(self.factory.filename, 'a'))
+        self.log_n_print("[connected at %s]" %
+                    time.asctime(time.localtime(time.time())))
+
+    def connectionLost(self, reason):
+        irc.IRCClient.connectionLost(self, reason)
+        self.log_n_print("[disconnected at %s]" %
+                    time.asctime(time.localtime(time.time())))
+        self.logger.close()
+
+    # Event Callbacks
     def signedOn(self):
+        """Called when bot has succesfully signed on to server."""
+        self.log_n_print("[Signed on as %s]" % self.nickname)
         self.join(self.factory.channel)
-        print "Signed on as %s." % (self.nickname,)
+
+    def joined(self, channel):
+        """This will get called when the bot joins the channel."""
+        self.log_n_print("[I have joined %s]" % channel)
+
+    def action(self, user, channel, data):
+        nick = user.split('!', 1)[0]
+        self.log_n_print("%s%s %s" % (" " * (20 - len(nick)), '*' + nick, data))
 
     def privmsg(self, user, channel, msg):
         nick = user.split('!', 1)[0]
-        print 'message `%s` from: %s' % (msg, nick)
+        self.log_n_print("%s<%s> %s" % (" " * (19 - len(nick)), nick, msg))
         if not user:
             return
         if self.nickname in msg:
             msg = re.compile(self.nickname + "[:,]* ?", re.I).sub('', msg)
             prefix = "%s: " % (user.split('!', 1)[0], )
+        elif channel == self.nickname and msg[0] == '!':
+            msg = msg[1:]
+            prefix = '!'
         else:
             prefix = ''
-        if prefix or channel == self.factory.nickname:
+        if prefix:
             # if i have been mentioned (eg nick: ) run possible commands
-            print 'mentioned'
-            self.mentioned(nick, msg)
-        print SEPERATOR
-
-    def irc_JOIN(self, prefix, params):
-        user = prefix.split('!')[0]
-        if user == self.factory.nickname:
-            print "Joined %s." % (params[0],)
             print SEPERATOR
-        if user in ['speilberg0', 'marcogmontiero', 'dshoreman', 'pfote', 'code', 'Zogot']:
-            self.msg(self.factory.channel, 'Welcome back, %s' % user)
-        if re.match(r'.*gateway/web/freenode.*', prefix):
-            print "%s is from web gateway" % (user)
-            self.msg(self.factory.channel, 'Hi %s, if you have a question just ask and someone will answer soon. Please post relevant code to http://pastebin.com.' % user)
+            self.log_n_print('mentioned by %s in channel %s' % (nick, channel))
+            self.command(user, msg)
+            print SEPERATOR
 
-    def mentioned(self, nick, msg):
+    def command(self, user, msg):
+        nick = user.split('!', 1)[0]
+
+        if msg == 'commands':
+            response = 'commands, ' + ', '.join(commands.keys()) + " [quit, action verb function, changeNick new_nick]"
+            self.msg(nick, response)
+            return
+
         #bot operators
         if nick in ['speilberg0']:
-            self.botops(nick, msg)
+            self.botops(user, msg)
 
         # now that high priority stuff is out of the way, lets run commands or string subs
         if ' ' not in msg:
             cmd = msg
+            rest = ''
         else:
             (cmd, rest) = msg.split(' ', 1)
         if cmd in commands:
-            response = commands[cmd](rest)
+            if rest:
+                response = commands[cmd](rest)
+            else:
+                response = commands[cmd]()
             if response[:3] == '/me':
                 self.describe(self.factory.channel, response[4:])
+                self.log_n_print("[Ran command %s with response %s]" % (cmd, response))
             else:
                 self.msg(self.factory.channel, response)
-        elif cmd in strings:
-            response = strings[msg]
-            self.msg(self.factory.channel, response)
+                self.log_n_print("[Ran command %s with response %s]" % (cmd, response))
 
-    def botops(self, nick, msg):
-        print 'message `%s` from botop: %s' % (msg, nick)
-        match = re.match('^action (\w*) (lambda.*)$', msg)
-        if match:
-            commandname = match.group(1)
-            command = match.group(2)
+    # irc callbacks
+    def irc_NICK(self, prefix, params):
+        """Called when an IRC user changes their nick"""
+        old_nick = prefix.split('!')[0]
+        new_nick = params[0]
+        self.log_n_print("[%s is now known as %s]" % (old_nick, new_nick))
+
+    def botops(self, user, msg):
+        nick = user.split('!', 1)[0]
+        self.log_n_print('message `%s` from botop: %s' % (msg, nick))
+        if msg == 'quit':
+            self.describe(self.factory.channel, "Shutting down...")
+            reactor.stop()
+        new_nick = re.match('^changeNick (\w+)', msg)
+        new_channel = re.match('^changeChan (#\w+)', msg)
+        action = re.match('^action (\w*) (lambda.*)$', msg)
+        if action:
+            commandname = action.group(1)
+            command = action.group(2)
             add_to_brain(commandname, 'function', command, write_to_file=True)
-            print commandname
-            print command
+            self.log_n_print("[New command `%s` added: %s]" % (commandname, command))
+        elif new_nick:
+            self.setNick(new_nick.group(1))
+        elif new_channel:
+            new_channel = new_channel.group(1)
+            old_channel = self.factory.channel
+            self.log_n_print("[Changed channel from %s to %s]" % (old_channel, new_channel))
+            self.join(new_channel)
+            self.leave(old_channel)
 
-
-class MomBotFactory(protocol.ClientFactory):
-    protocol = MomBot
-
-    def __init__(self, channel, nickname='speilb0rg', max_words=10000):
-        self.channel = channel
-        self.nickname = nickname
-        self.max_words = max_words
-
-    def clientConnectionLost(self, connector, reason):
-        print "Lost connection (%s), reconnecting." % (reason,)
-        connector.connect()
-
-    def clientConnectionFailed(self, connector, reason):
-        print "Could not connect: %s" % (reason,)
-
-
-strings = defaultdict(list)
-commands = defaultdict(list)
+    def log_n_print(self, message):
+        print message
+        self.logger.log(message)
 
 
 def add_to_brain(command, cmdtype, action, write_to_file=False):
     if cmdtype == 'function':
         commands[command] = eval(action)
         print 'added command %s to memory' % (command)
-    else:
-        strings[command] = action
-        print 'added string %s to memory' % (command)
     if write_to_file:
         commandstore = '%s!%s!%s\n' % (command, cmdtype, action)
-        with open('stored_commands.pkl', 'a') as f:
+        with open('stored_commands.txt', 'a') as f:
             f.write(commandstore)
 
 
-def lmgtfy(query):
-    q = 'http://lmgtfy.com/?q=' + '+'.join(query.split(' '))
-    return q
+class MomBotFactory(protocol.ClientFactory):
+    """
+    Pretty standard clientfactory
+    Instantiates MomBot and reconnects if disconnected
+    """
+
+    def __init__(self, channel, nickname='speilb0rg', filename='speilb0rg-log.txt'):
+        self.channel = channel
+        self.nickname = nickname
+        self.filename = filename
+
+    def buildProtocol(self, addr):
+        p = MomBot()
+        p.factory = self
+        return p
+
+    def clientConnectionLost(self, connector, reason):
+        print "Lost connection (%s), reconnecting." % (reason,)
+        connector.connect()
+
+    def clientConnectionFailed(self, reason):
+        print "Could not connect: %s" % (reason,)
+        reactor.stop()
+
 
 if __name__ == '__main__':
-    try:
+    chan = "#codeigniter"
+    intl = 'irc.freenode.net'
+    brisbane = 'roddenberry.freenode.net'
+    if len(sys.argv) > 1:
         chan = sys.argv[1]
-    except IndexError:
-        print "Please specify a channel name."
-        print "Example: "
-        print " main.py test7654"
-    if os.path.exists('stored_commands.pkl'):
-        with open('stored_commands.pkl', 'rb') as f:
+
+    log.startLogging(sys.stdout)
+
+    if os.path.exists('stored_commands.txt'):
+        with open('stored_commands.txt', 'rb') as f:
             for line in f:
                 (command, cmdtype, action) = line.split('!', 2)
                 add_to_brain(command, cmdtype, action)
         print 'loaded commands'
         print SEPERATOR
 
-    reactor.connectTCP('irc.freenode.net', 6667, MomBotFactory('#' + chan))
+    f = MomBotFactory(chan)
+
+    reactor.connectTCP(intl, 6667, f)
     print 'connecting to freenode'
     reactor.run()
